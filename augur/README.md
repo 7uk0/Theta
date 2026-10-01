@@ -162,6 +162,17 @@ you are already talking to.
 Dependencies went from ten (including `google-genai`, `mcp`, `fastapi`,
 `uvicorn`, `pydantic`) to two: `orjson` and `watchdog`.
 
+## Where it has to run
+
+`augur` reads save files, so it runs on the machine holding them — Wolf-Box, not
+a cloud container. A Claude Code session driven from a phone cannot see those
+saves. Two ways to work:
+
+- **Claude Code on Wolf-Box** — the intended setup. The skill triggers, the CLI
+  runs locally, nothing crosses the network.
+- **From a phone** — the container has no access to the saves. See
+  `docs/PORT-NOTES.md` for what that constrains.
+
 ## Tests
 
 ```bash
