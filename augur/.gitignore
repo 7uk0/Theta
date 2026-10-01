@@ -1,0 +1,18 @@
+# Rust build output
+stellaris-parser/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+venv/
+.venv/
+
+# Local campaign archive and rendered briefings
+*.db
+*.db-wal
+*.db-shm
+latest.md
