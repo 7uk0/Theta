@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(augur:*)",
+      "Bash(python3 -m augur.cli:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(python3 -m ruff:*)",
+      "Bash(cargo build:*)",
+      "Bash(./install.sh:*)",
+      "Write(/tmp/**)"
+    ]
+  }
+}
