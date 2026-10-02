@@ -383,7 +383,7 @@ class GameDatabase:
             raise RuntimeError(
                 "Could not create and verify the campaign-history safety backup. "
                 "The database upgrade was stopped before changing existing campaign data. "
-                "Check available disk space and app-data folder permissions, then reopen the app."
+                "Check available disk space and app-data folder permissions, then run augur again."
             ) from exc
 
     # --- Phase 3 Milestone 1: sessions + snapshot writes ---

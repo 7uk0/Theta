@@ -3,9 +3,11 @@
     "allow": [
       "Bash(augur:*)",
       "Bash(python3 -m augur.cli:*)",
-      "Bash(cd ~/Theta/augur && python3 -m augur.cli:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(python3 -m ruff:*)",
       "Bash(cargo build:*)",
-      "Bash(python3 -m pytest:*)"
+      "Bash(./install.sh:*)",
+      "Write(/tmp/**)"
     ]
   }
 }

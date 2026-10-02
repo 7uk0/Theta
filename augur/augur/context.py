@@ -199,6 +199,19 @@ class CampaignContext:
         if self._owns_db:
             self.db.close()
 
+    def current_session_id(self) -> str | None:
+        """The id of the session every other read here describes.
+
+        Exposed because callers that query the snapshot table directly (the
+        dashboard's trend series) must scope to the same session, and
+        `db.get_sessions()` orders differently and does not filter trashed
+        playthroughs.
+        """
+        session = self._get_current_session()
+        if not session:
+            return None
+        return str(session.get("id") or "") or None
+
     def get_active_campaign(self) -> dict[str, Any]:
         session = self._get_current_session()
         if not session:
@@ -283,9 +296,9 @@ class CampaignContext:
             payload["briefing_mode"] = "focused_fallback"
             payload["briefing"] = self._select_briefing_sections(briefing, resolved_focus)
             payload["briefing_note"] = (
-                "The rich Advisor Briefing exceeded the local payload ceiling, so this "
-                "response includes a focused section fallback. Use get_empire_briefing "
-                "for follow-up detail if needed."
+                "The full briefing exceeded the local payload ceiling, so this response "
+                "includes a focused section fallback. Run `augur detail --sections ...` "
+                "for follow-up depth if needed."
             )
         payload["briefing_size_chars"] = len(json.dumps(payload["briefing"], ensure_ascii=False))
         return _drop_empty(payload)
@@ -1209,8 +1222,8 @@ class CampaignContext:
             ),
             "naval_capacity_policy": self._naval_capacity_guidance(briefing),
             "tool_use_policy": {
-                "main_tool": "Advisor Briefing is the preferred context for strategy questions.",
-                "section_tool": "Use Empire Briefing only for follow-up detail or context-budget constraints.",
+                "main_tool": "`augur brief` is the preferred context for strategy questions.",
+                "section_tool": "Use `augur detail` only for follow-up depth or tight context budgets.",
                 "write_back_enabled": False,
                 "in_app_llm_called": False,
             },
@@ -1352,11 +1365,11 @@ class CampaignContext:
                 "apply this",
                 "save this to the Chronicle",
                 "write this back",
-                "save it back to the app",
+                "save it to the Chronicle",
             ],
             "suggested_phrase": (
                 'When you are happy with this version, say "save this to the Chronicle" '
-                "and I will send it back to the app."
+                "and I will save it to the Chronicle."
             ),
         }
 

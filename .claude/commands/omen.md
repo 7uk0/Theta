@@ -1,7 +1,7 @@
 ---
 description: Read the omens — strategic briefing on the current Stellaris campaign
 argument-hint: [question]
-allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*), Bash(cd:*)
+allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*)
 ---
 
 Use the `augur` skill to answer this question about the user's Stellaris campaign:

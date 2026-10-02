@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,15 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_NO_CAMPAIGN = 3
+
+# Phrases that mark a ContextError as "there is no campaign yet" rather than
+# "this request was wrong". Exit 3 is a caller's signal to run an ingest, so a
+# bad --chapter must not borrow it.
+_NO_CAMPAIGN_HINTS = ("no campaign", "not been ingested", "has no save_id")
+
+
+class _ArchiveUnreadable(RuntimeError):
+    """The archive file exists but SQLite cannot open it."""
 
 DEFAULT_DB_NAME = "campaign.db"
 FOCUS_CHOICES = [
@@ -169,15 +179,19 @@ def cmd_dash(args: argparse.Namespace) -> int:
 def cmd_saves(args: argparse.Namespace) -> int:
     from augur.parser.save_loader import find_all_saves, get_platform_save_paths
 
+    if args.limit < 1:
+        print("augur: --limit must be at least 1", file=sys.stderr)
+        return EXIT_USAGE
+
     search = [Path(args.save_dir).expanduser()] if args.save_dir else None
-    saves = find_all_saves(search) or []
-    saves = saves[: args.limit]
+    found = find_all_saves(search) or []
+    saves = found[: args.limit]
 
     if args.json:
         _emit([{k: str(v) for k, v in s.items()} for s in saves], as_json=True)
         return EXIT_OK
 
-    if not saves:
+    if not found:
         print("No .sav files found. Searched:", file=sys.stderr)
         for path in search or get_platform_save_paths():
             print(f"  {path}", file=sys.stderr)
@@ -203,18 +217,38 @@ def _with_context(args: argparse.Namespace):
             file=sys.stderr,
         )
         return None
-    return CampaignContext(db_path=db_path, language=args.language)
+    try:
+        return CampaignContext(db_path=db_path, language=args.language)
+    except sqlite3.DatabaseError as exc:
+        # A truncated or non-SQLite file reached us; a stack trace is not an
+        # answer the user can act on. This is a failure, not an empty archive,
+        # so it must not borrow exit 3.
+        raise _ArchiveUnreadable(
+            f"{db_path} is not a readable campaign archive ({exc}). "
+            "Move it aside and run `augur ingest` to rebuild it."
+        ) from exc
+
+
+def _context_error_code(exc: Exception) -> int:
+    message = str(exc).lower()
+    if any(hint in message for hint in _NO_CAMPAIGN_HINTS):
+        return EXIT_NO_CAMPAIGN
+    return EXIT_ERROR
 
 
 def _run_read(args: argparse.Namespace, fn, renderer, title: str) -> int:
-    context = _with_context(args)
+    try:
+        context = _with_context(args)
+    except _ArchiveUnreadable as exc:
+        print(f"augur: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     if context is None:
         return EXIT_NO_CAMPAIGN
     try:
         payload = fn(context)
     except ContextError as exc:
         print(f"augur: {exc}", file=sys.stderr)
-        return EXIT_NO_CAMPAIGN
+        return _context_error_code(exc)
     finally:
         context.close()
     _emit(payload, as_json=args.json, renderer=renderer, title=title)
@@ -289,7 +323,11 @@ def cmd_chronicle_source(args: argparse.Namespace) -> int:
 
 
 def _run_write(args: argparse.Namespace, fn) -> int:
-    context = _with_context(args)
+    try:
+        context = _with_context(args)
+    except _ArchiveUnreadable as exc:
+        print(f"augur: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     if context is None:
         return EXIT_NO_CAMPAIGN
     try:
@@ -365,6 +403,51 @@ def cmd_chronicle_undo(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------- doctor
 
 
+def cmd_knowledge(args: argparse.Namespace) -> int:
+    """Version-correct Stellaris mechanics for the installed patch.
+
+    This is the `augur/knowledge/patches/` corpus, selected for the save's own
+    game version so advice matches the rules actually in play rather than
+    whatever the reader remembers.
+    """
+    from augur.knowledge.game_knowledge import build_game_knowledge_prompt
+    from augur.knowledge.personality import get_available_patches
+
+    version = args.version_override
+    if not version:
+        # Prefer the version recorded in the archive, so this tracks the save.
+        try:
+            context = _with_context(args)
+        except _ArchiveUnreadable as exc:
+            print(f"augur: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        if context is not None:
+            try:
+                version = (context.get_active_campaign() or {}).get("version")
+            except ContextError:
+                version = None
+            finally:
+                context.close()
+
+    if not version:
+        available = get_available_patches()
+        print(
+            "augur: no game version known. Ingest a save first, or pass "
+            f"--game-version (have: {', '.join(available)})",
+            file=sys.stderr,
+        )
+        return EXIT_NO_CAMPAIGN
+
+    text = build_game_knowledge_prompt(
+        str(version), purpose=args.purpose, topics=args.topics or None
+    )
+    if args.json:
+        _emit({"game_version": str(version), "purpose": args.purpose, "knowledge": text}, as_json=True)
+    else:
+        sys.stdout.write(text.rstrip() + "\n")
+    return EXIT_OK
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check the things that actually break: parser binary, deps, saves, archive."""
     checks: list[tuple[bool, str, str]] = []
@@ -377,7 +460,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             (
                 exists,
                 f"Rust parser: {PARSER_BINARY}",
-                "Build it: cd stellaris-parser && cargo build --release",
+                "Build it: cd stellaris-parser && cargo build --release "
+                "(or set AUGUR_HOME to a checkout that has it built)",
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -402,21 +486,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     db_path = resolve_db_path(args.db)
     if db_path.exists():
         size_mb = db_path.stat().st_size / (1024 * 1024)
+        readable = True
         snapshot_note = ""
+        hint = ""
+        db = None
+        context = None
         try:
             db = GameDatabase(db_path=db_path)
             context = CampaignContext(db=db, language=args.language)
             campaign = context.get_active_campaign()
-            context.close()
-            db.close()
             if campaign.get("save_loaded"):
                 snapshot_note = (
                     f" — {campaign.get('empire_name')} @ {campaign.get('game_date')}, "
                     f"{campaign.get('snapshot_count')} snapshot(s)"
                 )
+            else:
+                snapshot_note = " — no campaign recorded yet"
+                hint = "Run: augur ingest"
         except Exception as exc:  # noqa: BLE001
+            # An unreadable archive is exactly what doctor exists to surface, so
+            # this check fails rather than reporting ok with a note.
+            readable = False
             snapshot_note = f" — could not read: {exc}"
-        checks.append((True, f"Archive: {db_path} ({size_mb:.1f} MB){snapshot_note}", ""))
+            hint = "Move it aside and run `augur ingest` to rebuild it."
+        finally:
+            if context is not None:
+                context.close()
+            if db is not None:
+                db.close()
+        checks.append((readable, f"Archive: {db_path} ({size_mb:.1f} MB){snapshot_note}", hint))
     else:
         checks.append((False, f"No archive yet at {db_path}", "Run: augur ingest"))
 
@@ -441,6 +539,47 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 # -------------------------------------------------------------------- parser
 
 
+def _global_flags() -> argparse.ArgumentParser:
+    """The flags that may appear on either side of the subcommand.
+
+    `augur brief --json` is what anyone types, so accept it as well as
+    `augur --json brief`. SUPPRESS is what makes that work: without it a
+    subparser writes its own default over a value the top level already set,
+    and the earlier flag is silently discarded.
+    """
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--db",
+        default=argparse.SUPPRESS,
+        help="Archive path (default: $AUGUR_DB or the XDG state dir).",
+    )
+    shared.add_argument(
+        "--language", default=argparse.SUPPRESS, help="Language scope for cached content."
+    )
+    shared.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Emit raw JSON instead of Markdown.",
+    )
+    return shared
+
+
+_GLOBAL_FLAGS = _global_flags()
+
+
+def _add_global_flags(parser: argparse.ArgumentParser) -> None:
+    for action in _GLOBAL_FLAGS._actions:
+        parser._add_action(action)
+
+
+def _normalise_globals(args: argparse.Namespace) -> None:
+    """Fill in the globals SUPPRESS left absent."""
+    args.db = getattr(args, "db", None)
+    args.language = getattr(args, "language", None) or "en"
+    args.json = bool(getattr(args, "json", False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="augur",
@@ -459,24 +598,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"augur {__version__}")
-    parser.add_argument("--db", default=None, help="Archive path (default: $AUGUR_DB or XDG state dir).")
-    parser.add_argument("--language", default="en", help="Language scope for cached content.")
-    parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of Markdown.")
+    _add_global_flags(parser)
 
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    p = sub.add_parser("ingest", help="Parse a save into the archive.", aliases=["read-save"])
+    def add(name: str, **kwargs) -> argparse.ArgumentParser:
+        kwargs.setdefault("parents", []).append(_GLOBAL_FLAGS)
+        return sub.add_parser(name, **kwargs)
+
+    p = add("ingest", help="Parse a save into the archive.", aliases=["read-save"])
     p.add_argument("--save", default=None, help="Save file or directory (default: newest found).")
     p.add_argument("--no-wait", action="store_true", help="Skip the save-stability wait.")
     p.set_defaults(func=cmd_ingest)
 
-    p = sub.add_parser("vigil", help="Watch the save folder and ingest continuously.", aliases=["watch"])
+    p = add("vigil", help="Watch the save folder and ingest continuously.", aliases=["watch"])
     p.add_argument("--save-dir", default=None, help="Directory to watch (default: platform paths).")
     p.add_argument("--render", default=None, help="Write a Markdown briefing here after each ingest.")
     p.add_argument("--no-initial", action="store_true", help="Do not ingest the existing newest save.")
     p.set_defaults(func=cmd_vigil)
 
-    p = sub.add_parser(
+    p = add(
         "dash",
         help="Live terminal dashboard: status, resources, trends, events.",
         aliases=["orrery", "dashboard"],
@@ -489,15 +630,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_dash)
 
-    p = sub.add_parser("saves", help="List detected save files.")
+    p = add("saves", help="List detected save files.")
     p.add_argument("--save-dir", default=None, help="Directory to search.")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_saves)
 
-    p = sub.add_parser("status", help="Active campaign: empire, date, snapshot count.")
+    p = add("status", help="Active campaign: empire, date, snapshot count.")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser(
+    p = add(
         "brief",
         help="Full strategy context for a question. The main read command.",
         aliases=["scry"],
@@ -507,23 +648,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--events", type=int, default=15, help="Recent events to include.")
     p.set_defaults(func=cmd_brief)
 
-    p = sub.add_parser("detail", help="Specific briefing sections for follow-up depth.")
+    p = add("detail", help="Specific briefing sections for follow-up depth.")
     p.add_argument("--sections", default=None, help="Comma-separated section names.")
     p.add_argument("--detail", default="compact", choices=["compact", "full"])
     p.set_defaults(func=cmd_detail)
 
-    p = sub.add_parser("events", help="Detected changes between saves.", aliases=["omens"])
+    p = add("events", help="Detected changes between saves.", aliases=["omens"])
     p.add_argument("--limit", type=int, default=25)
     p.add_argument("--notable", action="store_true", help="Only high-signal event types.")
     p.set_defaults(func=cmd_events)
 
-    chronicle = sub.add_parser("chronicle", help="Read and write the campaign narrative.")
+    chronicle = add("chronicle", help="Read and write the campaign narrative.")
     csub = chronicle.add_subparsers(dest="chronicle_command", metavar="<action>")
 
-    c = csub.add_parser("read", help="Saved Chronicle chapters.")
+    def add_action(name: str, **kwargs) -> argparse.ArgumentParser:
+        kwargs.setdefault("parents", []).append(_GLOBAL_FLAGS)
+        return csub.add_parser(name, **kwargs)
+
+    c = add_action("read", help="Saved Chronicle chapters.")
     c.set_defaults(func=cmd_chronicle_read)
 
-    c = csub.add_parser("source", help="Raw material for writing the next chapter.")
+    c = add_action("source", help="Raw material for writing the next chapter.")
     c.add_argument("--scope", default="current_era", help="current_era | chapter | all")
     c.add_argument("--chapter", type=int, default=None)
     c.add_argument("--max-events", type=int, default=80)
@@ -541,7 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--narrative-file", default=None, help="File holding the prose, or - for stdin."
         )
 
-    c = csub.add_parser("save", help="Write the current era as a chapter.")
+    c = add_action("save", help="Write the current era as a chapter.")
     add_write_guards(c)
     add_narrative(c)
     c.add_argument("--title", default=None)
@@ -549,7 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--events-covered", type=int, default=None)
     c.set_defaults(func=cmd_chronicle_save)
 
-    c = csub.add_parser("update", help="Rewrite an existing chapter.")
+    c = add_action("update", help="Rewrite an existing chapter.")
     add_write_guards(c)
     add_narrative(c)
     c.add_argument("--chapter", type=int, required=True)
@@ -558,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--epigraph", default=None)
     c.set_defaults(func=cmd_chronicle_update)
 
-    c = csub.add_parser("create", help="Add a new chapter.")
+    c = add_action("create", help="Add a new chapter.")
     add_write_guards(c)
     add_narrative(c)
     c.add_argument("--title", required=True)
@@ -568,12 +713,30 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--epigraph", default=None)
     c.set_defaults(func=cmd_chronicle_create)
 
-    c = csub.add_parser("undo", help="Revert the last external Chronicle edit.")
+    c = add_action("undo", help="Revert the last external Chronicle edit.")
     add_write_guards(c)
     c.add_argument("--edit-receipt", required=True)
     c.set_defaults(func=cmd_chronicle_undo)
 
-    p = sub.add_parser("doctor", help="Check parser, dependencies, saves and archive.")
+    p = add(
+        "knowledge",
+        help="Version-correct game mechanics for the save's patch.",
+        aliases=["lore"],
+    )
+    p.add_argument(
+        "--topics", default=None, help="Narrow to mechanics matching these words."
+    )
+    p.add_argument(
+        "--purpose", default="advisor", choices=["advisor", "chronicle"],
+        help="advisor: interpret the save. chronicle: explain recorded history.",
+    )
+    p.add_argument(
+        "--game-version", dest="version_override", default=None,
+        help="Override the version read from the archive (e.g. 4.5.1).",
+    )
+    p.set_defaults(func=cmd_knowledge)
+
+    p = add("doctor", help="Check parser, dependencies, saves and archive.")
     p.set_defaults(func=cmd_doctor)
 
     return parser
@@ -582,6 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _normalise_globals(args)
 
     if not getattr(args, "func", None):
         if getattr(args, "command", None) == "chronicle":
@@ -592,6 +756,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return int(args.func(args))
+    except _ArchiveUnreadable as exc:
+        print(f"augur: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     except ContextError as exc:
         print(f"augur: {exc}", file=sys.stderr)
         return EXIT_ERROR

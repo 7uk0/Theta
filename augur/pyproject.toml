@@ -51,4 +51,7 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --tb=short"
-markers = ["integration: needs a real .sav and the built Rust parser"]
+markers = [
+    "integration: needs a real .sav and the built Rust parser",
+    "slow: deselect with -m 'not slow'",
+]

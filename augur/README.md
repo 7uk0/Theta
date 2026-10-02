@@ -39,8 +39,14 @@ cd ~/Theta/augur
 ./install.sh
 ```
 
-That builds the parser, installs the package, links the skill and commands into
-`~/.claude` so they work from any directory, and runs a health check. Then:
+That builds the parser, installs into a virtualenv at `augur/.venv`, links an
+`augur` command into `~/.local/bin`, links the skill and commands into
+`~/.claude` so they work from any directory, and runs a health check.
+
+The virtualenv is deliberate: Debian 13 marks the system Python as externally
+managed (PEP 668), so installing into it is refused. Pass `--no-venv` if you
+manage your own environment, or `--repo-only` to skip the `~/.claude` links.
+Then:
 
 ```bash
 augur ingest                        # read your newest save
@@ -83,7 +89,8 @@ a guess.
 Then ask questions in a second terminal (`claude`). The dashboard tells you
 *that* something changed; the conversation tells you what to do about it.
 
-Keys: `r` re-read the newest save now, `j`/`k` scroll events, `q` quit.
+Keys: `r` re-read the newest save now, `j`/`k` scroll events, `q` quit. It wants
+at least 72x11; below that it says so rather than drawing a mangled frame.
 
 If you would rather not have a dashboard, `augur vigil` does the ingesting with
 no UI, and `--render PATH` writes a Markdown briefing after each save so even a
@@ -116,10 +123,15 @@ filling.
 | `augur detail --sections a,b` | Specific briefing sections, for follow-up depth. |
 | `augur events [--notable]` | What changed between saves. |
 | `augur chronicle read\|source\|save\|update\|create\|undo` | The campaign narrative. |
+| `augur knowledge [--topics ...]` | Version-correct game mechanics for the save's patch. |
 
-Markdown by default; `--json` for raw payloads. Exit codes: `0` ok, `1` error,
-`2` usage, `3` nothing ingested yet — so a caller can tell "no data" from
-"broken".
+Markdown by default; `--json` for raw payloads. The global flags (`--json`,
+`--db`, `--language`) work on either side of the subcommand, so both
+`augur brief --json` and `augur --json brief` are fine.
+
+Exit codes: `0` ok, `1` error, `2` usage, `3` nothing ingested yet — so a caller
+can tell "no data" from "broken". Exit 3 means specifically that: a bad argument
+on a populated archive is `1`.
 
 ### Where things live
 
@@ -165,7 +177,7 @@ you are already talking to.
 
 ### What came across, what didn't
 
-**Kept** (~32k lines, essentially unchanged):
+**Kept** (~26.6k lines, essentially unchanged):
 
 - `stellaris-parser/` — the Rust Clausewitz parser, including session mode
 - `augur/extractor/` — the whole extraction suite
@@ -195,6 +207,8 @@ you are already talking to.
 - `augur/render.py` — JSON → Markdown, roughly halving the token cost
 - `augur/dash.py` — the curses dashboard, replacing what the Electron app was
   for (watching state change without asking) on stdlib `curses` alone
+- `augur/knowledge/` is reached through `augur knowledge`, which selects the
+  patch-notes corpus for the save's own game version
 - `.claude/skills/augur/` — the advisor persona, factual-accuracy contract and
   Chronicle write protocol, carried over from the system prompt and the MCP
   server instructions

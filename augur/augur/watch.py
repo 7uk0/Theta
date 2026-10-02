@@ -15,7 +15,7 @@ import logging
 import signal
 import sys
 import threading
-import time
+import traceback
 from pathlib import Path
 
 from augur.core.database import GameDatabase
@@ -55,6 +55,7 @@ class Vigil:
         self._pending: Path | None = None
         self._wake = threading.Event()
         self._stop = threading.Event()
+        self._running = False
 
         self._watcher = SaveWatcher(
             watch_paths=watch_paths,
@@ -77,6 +78,7 @@ class Vigil:
             )
             return 1
 
+        self._running = True
         for path in self._watcher.get_valid_watch_paths():
             self._log(f"watching {path}")
 
@@ -96,18 +98,47 @@ class Vigil:
                     continue
 
                 # Let a burst of write events settle, then take the newest.
-                time.sleep(self._coalesce_seconds)
+                # Waiting on the stop event rather than sleeping means a
+                # shutdown during the coalesce window is honoured instead of
+                # starting an ingest that will outlive the database.
+                if self._stop.wait(timeout=self._coalesce_seconds):
+                    break
                 self._wake.clear()
                 with self._lock:
                     target, self._pending = self._pending, None
                 if target is None:
                     continue
+                if self._stop.is_set():
+                    # Put it back so a drain can still record it.
+                    with self._lock:
+                        self._pending = target
+                    break
 
                 self._ingest_once(target)
         finally:
             self._watcher.stop()
+            self._running = False
             self._log("stopped")
         return 0
+
+    def drain_pending(self) -> bool:
+        """Ingest the newest queued save, if shutdown raced one.
+
+        `stop()` during a coalesce window leaves the most recent autosave queued
+        and unrecorded. The owner calls this after the loop exits — while the
+        database is still open — so the save is not lost.
+        """
+        with self._lock:
+            target, self._pending = self._pending, None
+        if target is None:
+            return False
+        self._log(f"draining queued save {target.name}")
+        self._ingest_once(target)
+        return True
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
 
     def _ingest_once(self, save_path: Path) -> None:
         try:
@@ -116,8 +147,10 @@ class Vigil:
             self._log(str(exc))
             return
         except Exception as exc:  # noqa: BLE001 - a vigil must survive one bad save
-            logger.exception("Unexpected ingest failure")
+            # logger.exception() would write a traceback to stderr, which is the
+            # terminal a curses front end is painting. Send it to the sink.
             self._log(f"unexpected ingest failure: {exc}")
+            self._log(traceback.format_exc().strip().splitlines()[-1])
             return
 
         state = "new snapshot" if result.inserted else "refreshed"

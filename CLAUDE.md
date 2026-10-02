@@ -103,6 +103,18 @@ Keep it that way: the CLI is one caller, not the owner.
 
 - Event detection is a diff between snapshots. One ingest produces zero events;
   this is correct, not a bug.
+- Ingest is serialised process-wide by `augur.ingest._INGEST_LOCK`. Two
+  concurrent ingests on a fresh archive each create their own session and split
+  the campaign's history permanently. Never bypass it.
+- Anything that writes to the archive from a thread must be joined before the
+  database is closed, or the write dies half-done inside
+  `record_snapshot_from_briefing`. `Dashboard.shutdown()` is the pattern.
+- The archive runs in WAL mode, so a concurrent writer leaves the main `.db`
+  file's mtime untouched. Change detection must fingerprint `-wal` and `-shm`
+  too (`Dashboard._db_fingerprint`).
+- `db.get_sessions(limit=1)` is NOT the current session: it orders differently
+  and does not filter trashed playthroughs. Use
+  `CampaignContext.current_session_id()`.
 - Extractor field coverage against a real late-game save is **unvalidated** in
   this fork. If economy nets or pop counts come back zero on a real save, suspect
   the extractor's expected save structure before suspecting the CLI.
@@ -121,14 +133,16 @@ Keep it that way: the CLI is one caller, not the owner.
 psychedelic — where it does not cost clarity. `augur` reads omens in the
 heavens, which is what parsing a star empire's save amounts to. Subcommands stay
 plainly named so they are guessable, with flavoured aliases where they help
-(`scry` → `brief`, `omens` → `events`, `vigil` → `watch`). Flavour never wins
+(`scry` → `brief`, `omens` → `events`, `orrery` → `dash`; `vigil` is itself the
+canonical name, with `watch` as its alias). Flavour never wins
 over a name someone has to type correctly under pressure.
 
 **Tests.** Every flow carries its own tests and runs them with `pytest` from the
 flow directory. Tests that need hardware or local data get
 `@pytest.mark.integration` and skip cleanly without it.
 
-**Lint.** `ruff check .` per flow. Fix the cause, don't add a per-file ignore,
+**Lint.** `ruff check .` per flow. The suite is ~300 tests; most came from
+upstream and cover the extractor, event detection and signals. Fix the cause, don't add a per-file ignore,
 unless the file is vendored upstream code.
 
 **Ported code.** When cannibalizing an upstream project: compute the import

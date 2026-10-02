@@ -19,6 +19,7 @@ Nothing here contacts a model.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 # archive, so wait for size+mtime to hold still before touching it.
 STABLE_WINDOW_SECONDS = 0.6
 STABLE_MAX_WAIT_SECONDS = 15.0
+
+# Session creation and snapshot dedupe are both check-then-act against the
+# archive, so two ingests racing on a fresh database each create their own
+# session and the campaign's history is permanently split in two. One ingest at
+# a time per process; the parse dominates the runtime anyway.
+_INGEST_LOCK = threading.Lock()
 
 
 class IngestError(RuntimeError):
@@ -104,7 +111,13 @@ def wait_for_stable_save(
     window_seconds: float = STABLE_WINDOW_SECONDS,
     max_wait_seconds: float = STABLE_MAX_WAIT_SECONDS,
 ) -> bool:
-    """Block until the save stops changing. Returns False on timeout."""
+    """Block until the save stops changing.
+
+    Returns False on timeout — a file still growing when the deadline passes has
+    not been shown to be stable, and parsing it anyway is what the guard exists
+    to prevent. A large save on a slow disk can legitimately exceed the window;
+    the caller retries rather than reading a half-written archive.
+    """
     deadline = time.time() + max_wait_seconds
     last_signature: tuple[int, float] | None = None
     stable_since: float | None = None
@@ -127,7 +140,7 @@ def wait_for_stable_save(
             stable_since = None
         time.sleep(0.1)
 
-    return _is_readable_zip(save_path)
+    return False
 
 
 def _is_readable_zip(save_path: Path) -> bool:
@@ -146,7 +159,21 @@ def ingest_save(
     save_path: str | Path | None = None,
     wait_for_stable: bool = True,
 ) -> IngestResult:
-    """Parse a save and record a snapshot. The one write path into the archive."""
+    """Parse a save and record a snapshot. The one write path into the archive.
+
+    Serialised process-wide: the dashboard can have a vigil thread and a manual
+    re-read in flight at once, and overlapping writes split the campaign.
+    """
+    with _INGEST_LOCK:
+        return _ingest_locked(db=db, save_path=save_path, wait_for_stable=wait_for_stable)
+
+
+def _ingest_locked(
+    *,
+    db: GameDatabase,
+    save_path: str | Path | None,
+    wait_for_stable: bool,
+) -> IngestResult:
     started = time.time()
     timings: dict[str, float] = {}
     warnings: list[str] = []
@@ -214,7 +241,9 @@ def ingest_save(
     except FileNotFoundError as exc:
         # Almost always the unbuilt parser binary.
         raise IngestError(
-            f"{exc}\nBuild it with: cd stellaris-parser && cargo build --release"
+            f"{exc}\nBuild it with: cd stellaris-parser && cargo build --release\n"
+            "If augur is installed from a wheel, set AUGUR_HOME to a checkout "
+            "holding the built parser."
         ) from exc
 
     mark = time.time()

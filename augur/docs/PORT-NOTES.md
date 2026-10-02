@@ -36,7 +36,7 @@ seeds: mcp.context, save_extractor, core.history, core.signals, core.utils,
        core.save_watcher, core.ingestion_worker
 ```
 
-The closure came back at **40 Python files** needing exactly two third-party
+The closure came back at **40 Python files** (44 in the package today, after the files added below) needing exactly two third-party
 packages: `orjson` and `watchdog`. Everything in `pyproject.toml` beyond those —
 `google-genai`, `google-auth`, `mcp`, `fastapi`, `uvicorn`, `pydantic`,
 `httpx`, `python-dotenv` — fell outside it. That is the signal that the paid-API
@@ -67,6 +67,7 @@ surface was genuinely separable rather than tangled through the extractor.
 | `backend/mcp/server.py`, `mcpb/` | The MCP server and its Claude Desktop bundle. The point of the fork. |
 | `cloudflare/`, `workers/` | Discord `/ask` relay and feedback-collection worker. Both are hosted services; neither is wanted. |
 | `backend/core/conversation.py`, `reporting.py` | Chat history for the in-app model, and opt-in issue reporting to the upstream worker. |
+| `backend/core/ingestion_worker.py` | The cancellable subprocess worker. Its pipeline lives on in `augur/ingest.py`, run straight through instead of in a child process. |
 | `backend/core/ingestion.py` | The threaded ingestion manager: latest-only scheduling, subprocess cancellation, stability windows, staleness marking. All of it exists because a GUI cannot block for 90 seconds. A CLI can. Replaced by `augur/ingest.py`, which is the same pipeline run straight through. |
 | `stellaris-backend.spec`, `scripts/build-*.sh`, `scripts/publish-*`, `announcements.json` | PyInstaller, electron-builder, macOS notarization, release manifests, in-app announcements. |
 | `qa_export.py`, `qa_check.py` | Upstream QA tooling against their own fixtures. `validation.py` was kept in the tree as it may be useful later. |
@@ -78,7 +79,10 @@ surface was genuinely separable rather than tangled through the extractor.
 | `augur/cli.py` | The command surface. One subcommand per former MCP tool. Exit codes are meaningful: `3` means "nothing ingested yet", distinct from `1` "something broke", so a caller can tell them apart without parsing text. |
 | `augur/ingest.py` | Standalone ingestion. Includes the save-stability guard worth keeping from upstream's manager: Stellaris writes the zip in place, and parsing mid-write gets you a truncated archive, so wait for size+mtime to settle and confirm both `gamestate` and `meta` are present. |
 | `augur/watch.py` | The vigil. Coalesces a burst of write events into one ingest, newest-wins, and survives a bad save rather than dying on it. |
+| `augur/dash.py` | The curses dashboard — what the Electron app was for, on stdlib `curses` so no dependency was added. Its pure parts are unit-tested; the curses path is driven in a pty by `scripts/smoke_dash.py`. |
 | `augur/render.py` | JSON → Markdown. Roughly halves the token cost of handing a briefing to a model and reads better. Deliberately generic — headings from sections, tables where uniform records appear, bullets elsewhere — so an extractor change adds fields rather than breaking output. |
+| `install.sh` | Builds the parser, installs into a virtualenv (Debian 13 refuses a system pip install under PEP 668), links `augur` into `~/.local/bin` and the skill into `~/.claude`. |
+| `../.claude/commands/{omen,chronicle,vigil}.md` | Slash commands for the explicit route. |
 | `../.claude/skills/augur/SKILL.md` | Where the advisor persona went. Upstream split it between `companion.py`'s system prompt and the MCP server's `SERVER_INSTRUCTIONS`. Both targeted an external reasoner, so both collapse into one skill: persona, factual-accuracy contract, naval-capacity trap, Chronicle write protocol. |
 
 ## Fixed in passing

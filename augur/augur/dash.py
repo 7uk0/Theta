@@ -18,8 +18,11 @@ are unit-testable without a terminal.
 from __future__ import annotations
 
 import curses
+import logging
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,8 +35,102 @@ TREND_POINTS = 12
 MAX_LOG_LINES = 50
 MAX_EVENTS = 60
 
+# Below this the masthead, alert strip and column headings leave no room for an
+# actual entry, so the dashboard says what it needs instead of drawing a husk.
+MIN_ROWS = 11
+# The two-column block needs this much before the resource values start getting
+# clipped. 80 is the universal default terminal width, so this costs nothing in
+# practice; a narrower pane gets told rather than shown a mangled frame.
+MIN_COLS = 72
+
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 SPARK_ASCII = "_.-~=+*#"
+
+# Resources worth a row of their own, in the order a player triages them.
+# Keys that appear alongside the "<name>_net" fields but are totals held, not
+# income. `minor_artifacts` is the one the extractor actually publishes this way
+# (see augur/extractor/economy.py), and `resources_in_deficit` is a count.
+NON_NET_KEYS = frozenset({"minor_artifacts", "resources_in_deficit"})
+
+# The accent is drawn from the empire's own ethos, the way the advisor's voice
+# is. A militarist dominion should not read like a materialist research state,
+# and a machine intelligence should feel colder than either.
+ETHOS_ACCENT = {
+    "militarist": 203,
+    "pacifist": 114,
+    "xenophile": 44,
+    "xenophobe": 208,
+    "materialist": 45,
+    "spiritualist": 141,
+    "egalitarian": 75,
+    "authoritarian": 178,
+}
+GESTALT_ACCENT = {"machine": 51, "hive": 107}
+DEFAULT_ACCENT = 45  # Stellaris interface cyan
+
+PAIR_ACCENT, PAIR_WARN, PAIR_ALERT, PAIR_GOOD, PAIR_DIM = 1, 2, 3, 4, 5
+BAR = "▌"
+ALERT_MARK = "▲"
+STATUS_MARK = "◆"
+
+
+# Rows the situation log needs at minimum: its own heading plus one entry.
+LOG_MIN_ROWS = 2
+
+
+def budget_columns(*, available: int, longest_column: int) -> int:
+    """How many rows the EMPIRE / RESOURCE LEDGER columns may use.
+
+    `available` is the space between the column headings and the footer. The log
+    is always left room, so on a short terminal the fact list is truncated rather
+    than crowding out what changed.
+    """
+    if available <= 0 or longest_column <= 0:
+        return 0
+    # +1 for the blank row between the columns and whatever pane follows them.
+    return max(1, min(longest_column, available - LOG_MIN_ROWS - 1))
+
+
+def budget_panes(*, available: int, trend_count: int, event_count: int) -> int:
+    """How many trend rows may be drawn, given the height left for both panes.
+
+    The situation log is the more informative pane, so it is served first and
+    trends are trimmed to fit. Returning 0 means the trajectory pane is dropped
+    entirely rather than pushing the log off the bottom of the screen.
+
+    `available` counts the rows between the two-column block and the footer.
+    Each pane costs one row for its own heading.
+    """
+    if available <= 0 or trend_count <= 0:
+        return 0
+    log_need = min(event_count + 1, 5) if event_count else LOG_MIN_ROWS
+    # -2: the trajectory pane costs a heading row and the blank row that
+    # separates it from the log. Charging only for the heading let the spacer
+    # eat into the log's reservation, leaving it a heading and no entries.
+    room = available - log_need - 2
+    if room < 1:
+        return 0
+    return min(trend_count, room)
+
+
+
+
+def accent_for(identity: dict[str, Any]) -> int:
+    """Pick the 256-colour accent an empire's ethos earns."""
+    if not isinstance(identity, dict):
+        return DEFAULT_ACCENT
+    if identity.get("is_machine"):
+        return GESTALT_ACCENT["machine"]
+    if identity.get("is_hive_mind"):
+        return GESTALT_ACCENT["hive"]
+    ethics = identity.get("ethics") if isinstance(identity.get("ethics"), list) else []
+    names = [str(e).lower().replace("ethic_", "") for e in ethics]
+    # A fanatic ethic defines the empire more than its secondary does.
+    for name in sorted(names, key=lambda n: 0 if n.startswith("fanatic") else 1):
+        for key, colour in ETHOS_ACCENT.items():
+            if key in name:
+                return colour
+    return DEFAULT_ACCENT
 
 # Resources worth a row of their own, in the order a player triages them.
 TRACKED_RESOURCES = (
@@ -82,6 +179,8 @@ class DashState:
     trends: list[Trend] = field(default_factory=list)
     events: list[tuple[str, str, str]] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
+    subtitle: str = ""
+    accent: int = DEFAULT_ACCENT
 
 
 # ------------------------------------------------------------------ formatting
@@ -179,6 +278,11 @@ def extract_nets(sections: dict[str, Any]) -> dict[str, float]:
     for source in candidates:
         for key, value in source.items():
             if key.startswith("_") or not isinstance(value, (int, float)):
+                continue
+            if key in NON_NET_KEYS:
+                # resources.summary mixes a few stockpile totals in among the
+                # "<name>_net" fields; counting those as income reads as a huge
+                # monthly surplus that is really just the amount held.
                 continue
             name = key[:-4] if key.endswith("_net") else key
             nets.setdefault(name, float(value))
@@ -296,7 +400,11 @@ def build_state(*, context: CampaignContext, db: GameDatabase) -> DashState:
         if name not in TRACKED_RESOURCES and isinstance(held, (int, float)) and held:
             state.stockpiles.append((label_of(name), fmt_number(held), fmt_signed(nets.get(name))))
 
-    state.trends = build_trends(db=db, session_id=_session_id(db))
+    identity = section("identity") or _identity_from_archive(db)
+    state.accent = accent_for(identity)
+    state.subtitle = build_subtitle(identity)
+
+    state.trends = build_trends(db=db, session_id=_current_session_id(context))
     state.alerts = collect_alerts(briefing, state.trends)
 
     try:
@@ -316,14 +424,54 @@ def build_state(*, context: CampaignContext, db: GameDatabase) -> DashState:
     return state
 
 
-def _session_id(db: GameDatabase) -> str | None:
+def build_subtitle(identity: dict[str, Any]) -> str:
+    """AUTHORITY · ETHIC · ETHIC — the empire's character, in its own terms."""
+    if not isinstance(identity, dict):
+        return ""
+    parts: list[str] = []
+    if identity.get("is_machine"):
+        parts.append("MACHINE INTELLIGENCE")
+    elif identity.get("is_hive_mind"):
+        parts.append("HIVE MIND")
+    elif identity.get("authority"):
+        parts.append(str(identity["authority"]).replace("auth_", "").replace("_", " ").upper())
+    ethics = identity.get("ethics") if isinstance(identity.get("ethics"), list) else []
+    for ethic in ethics[:3]:
+        parts.append(str(ethic).replace("ethic_", "").replace("_", " ").upper())
+    return " · ".join(parts)
+
+
+def _identity_from_archive(db: GameDatabase) -> dict[str, Any]:
+    """Identity is not in a compact briefing; read it from the stored one."""
+    import json
+
     try:
-        sessions = db.get_sessions(limit=1)
+        row = db.execute("SELECT latest_briefing_json FROM sessions LIMIT 1;").fetchone()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not row or not row[0]:
+        return {}
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return {}
+    identity = payload.get("identity") if isinstance(payload, dict) else None
+    return identity if isinstance(identity, dict) else {}
+
+
+def _current_session_id(context: CampaignContext) -> str | None:
+    """The session the rest of the dashboard is describing.
+
+    `db.get_sessions(limit=1)` orders by `started_at` and does not filter trashed
+    playthroughs, so it can name a different campaign than
+    `CampaignContext._get_current_session`. Using it for the trends pane rendered
+    an abandoned campaign's history under the active campaign's header — and fed
+    the wrong series to the MILITARY DOWN alert. Ask the context instead.
+    """
+    try:
+        return context.current_session_id()
     except Exception:  # noqa: BLE001 - a dashboard must not die on a read
         return None
-    if not sessions:
-        return None
-    return str(sessions[0].get("id") or "") or None
 
 
 def build_trends(*, db: GameDatabase, session_id: str | None) -> list[Trend]:
@@ -361,6 +509,20 @@ def build_trends(*, db: GameDatabase, session_id: str | None) -> list[Trend]:
 # --------------------------------------------------------------------- curses
 
 
+class _SinkHandler(logging.Handler):
+    """Routes log records into the dashboard's own log pane."""
+
+    def __init__(self, sink) -> None:
+        super().__init__(level=logging.WARNING)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._sink(record.getMessage())
+        except Exception:  # noqa: BLE001 - logging must never raise
+            pass
+
+
 class Dashboard:
     def __init__(
         self,
@@ -383,6 +545,7 @@ class Dashboard:
         self._unicode_ok = True
         self._vigil = None
         self._vigil_thread: threading.Thread | None = None
+        self._ingest_threads: list[threading.Thread] = []
         self._status = "starting"
 
     # -- plumbing
@@ -419,17 +582,25 @@ class Dashboard:
             target=self._vigil.run, kwargs={"ingest_existing": True}, daemon=True
         )
         self._vigil_thread.start()
-        self._status = "vigil running"
+        self._status = "vigil starting"
 
     def _ingest_now(self) -> None:
         """Manual 'r' — ingest in a thread so the UI keeps drawing."""
+        # Drop threads that have finished, so holding 'r' cannot grow the list
+        # without bound.
+        self._ingest_threads = [t for t in self._ingest_threads if t.is_alive()]
+        if self._ingest_threads:
+            self.log("a re-read is already running")
+            return
 
         def work() -> None:
             from augur.ingest import IngestError, ingest_save
 
             self.log("re-reading newest save…")
             try:
-                result = ingest_save(db=self._db, save_path=None)
+                # Honour the watched directory: ingest_save(None) searches only
+                # the platform defaults, which may hold a different campaign.
+                result = ingest_save(db=self._db, save_path=self._explicit_save_dir())
             except IngestError as exc:
                 self.log(str(exc))
                 return
@@ -442,7 +613,15 @@ class Dashboard:
             )
             self.refresh_state()
 
-        threading.Thread(target=work, daemon=True).start()
+        thread = threading.Thread(target=work, daemon=True, name="augur-reread")
+        self._ingest_threads.append(thread)
+        thread.start()
+
+    def _explicit_save_dir(self) -> Path | None:
+        """The directory the user told us to watch, if they named one."""
+        if self._watch_paths:
+            return self._watch_paths[0]
+        return None
 
     # -- entry point
 
@@ -452,22 +631,73 @@ class Dashboard:
             self._start_vigil()
         else:
             self._status = "watch off"
-        try:
-            curses.wrapper(self._loop)
-        finally:
-            if self._vigil is not None:
-                self._vigil.stop()
+        with self._captured_logging():
+            try:
+                curses.wrapper(self._loop)
+            finally:
+                self.shutdown()
         return 0
+
+    @contextmanager
+    def _captured_logging(self):
+        """Keep stderr clear while curses owns the terminal.
+
+        Anything that reaches the root logger is written to stderr by the
+        lastResort handler, which lands a traceback on top of the display and
+        leaves the screen unreadable. Attach our own handler for the duration and
+        put the records in the footer instead.
+        """
+        root = logging.getLogger()
+        handler = _SinkHandler(self.log)
+        previous_handlers = list(root.handlers)
+        previous_level = root.level
+        root.handlers = [handler]
+        root.setLevel(logging.WARNING)
+        try:
+            yield
+        finally:
+            root.handlers = previous_handlers
+            root.setLevel(previous_level)
+
+    def shutdown(self, *, timeout: float = 30.0) -> None:
+        """Stop writers and wait for them, before the database is closed.
+
+        Setting the stop flag is not enough: an ingest already inside
+        `record_snapshot_from_briefing` keeps using the connection, and closing
+        it underneath raises `ProgrammingError` deep in the write — losing the
+        autosave, or leaving a snapshot row with no events. So join every writer,
+        then drain whatever shutdown raced.
+        """
+        deadline = time.time() + timeout
+        if self._vigil is not None:
+            self._vigil.stop()
+        if self._vigil_thread is not None and self._vigil_thread.is_alive():
+            self._vigil_thread.join(timeout=max(0.0, deadline - time.time()))
+        for thread in self._ingest_threads:
+            if thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.time()))
+        self._ingest_threads = []
+        if self._vigil is not None:
+            # A save queued when the stop arrived is still unrecorded; the
+            # database is open for a moment longer, so record it now.
+            try:
+                self._vigil.drain_pending()
+            except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+                # curses is already torn down here, so stderr is the terminal again.
+                print(f"augur: could not record the queued save: {exc}", file=sys.stderr)
 
     def _loop(self, stdscr) -> None:
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.keypad(True)
-        self._init_colors()
+        with self._lock:
+            accent = self._state.accent
+        self._init_colors(accent)
+        self._themed_accent = accent
         self._unicode_ok = self._probe_unicode(stdscr)
 
         last_poll = 0.0
-        last_db_mtime = self._db_mtime()
+        last_fingerprint = self._db_fingerprint()
 
         while True:
             now = time.time()
@@ -475,14 +705,19 @@ class Dashboard:
                 last_poll = now
                 # Another process (a standalone vigil, or an ingest) may have
                 # written to the archive; pick that up without being told.
-                mtime = self._db_mtime()
-                if mtime != last_db_mtime:
-                    last_db_mtime = mtime
+                fingerprint = self._db_fingerprint()
+                if fingerprint != last_fingerprint:
+                    last_fingerprint = fingerprint
                     self.refresh_state()
                 self._dirty.set()
 
             if self._dirty.is_set():
                 self._dirty.clear()
+                with self._lock:
+                    accent = self._state.accent
+                if accent != getattr(self, "_themed_accent", None):
+                    self._init_colors(accent)
+                    self._themed_accent = accent
                 self._draw(stdscr)
 
             try:
@@ -505,19 +740,29 @@ class Dashboard:
             elif key == -1:
                 time.sleep(0.05)
 
-    @staticmethod
-    def _init_colors() -> None:
+    def _init_colors(self, accent: int = DEFAULT_ACCENT) -> None:
         if not curses.has_colors():
             return
-        curses.start_color()
-        curses.use_default_colors()
-        for index, fg in enumerate(
-            (curses.COLOR_CYAN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_GREEN), start=1
-        ):
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            return
+        # Fall back to the 8 base colours where 256 are not available.
+        rich = getattr(curses, "COLORS", 8) >= 256
+        palette = {
+            PAIR_ACCENT: accent if rich else curses.COLOR_CYAN,
+            PAIR_WARN: 214 if rich else curses.COLOR_YELLOW,
+            PAIR_ALERT: 203 if rich else curses.COLOR_RED,
+            PAIR_GOOD: 114 if rich else curses.COLOR_GREEN,
+            PAIR_DIM: 244 if rich else curses.COLOR_WHITE,
+        }
+        for pair, colour in palette.items():
             try:
-                curses.init_pair(index, fg, -1)
+                curses.init_pair(pair, colour, -1)
             except curses.error:
                 pass
+        self._accent = accent
 
     @staticmethod
     def _probe_unicode(stdscr) -> bool:
@@ -530,11 +775,23 @@ class Dashboard:
             stdscr.erase()
             return False
 
-    def _db_mtime(self) -> float:
-        try:
-            return Path(self._db.path).stat().st_mtime
-        except OSError:
-            return 0.0
+    def _db_fingerprint(self) -> tuple:
+        """A cheap change signal that survives WAL mode.
+
+        In WAL journal mode a concurrent writer appends to `<db>-wal` and leaves
+        the main file's mtime untouched until a checkpoint, so watching the main
+        file alone makes `--no-watch` display a frozen frame while a separate
+        vigil fills the archive. Fingerprint the whole set.
+        """
+        base = Path(self._db.path)
+        parts: list[tuple] = []
+        for path in (base, base.with_name(base.name + "-wal"), base.with_name(base.name + "-shm")):
+            try:
+                stat = path.stat()
+                parts.append((path.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                parts.append((path.name, 0, 0))
+        return tuple(parts)
 
     # -- drawing
 
@@ -545,99 +802,202 @@ class Dashboard:
 
         stdscr.erase()
         height, width = stdscr.getmaxyx()
-        if height < 8 or width < 40:
-            self._put(stdscr, 0, 0, "Terminal too small for the orrery.", width)
+        if height < MIN_ROWS or width < MIN_COLS:
+            self._put(
+                stdscr, 0, 0,
+                f"augur needs {MIN_COLS}x{MIN_ROWS}; this terminal is {width}x{height}.",
+                width,
+            )
+            if height > 1:
+                # Even here, show the one thing worth shouting.
+                with self._lock:
+                    alerts = list(self._state.alerts)
+                self._put(stdscr, 1, 0, "  ".join(alerts) if alerts else "[q] quit", width)
             stdscr.refresh()
             return
 
-        cyan = self._pair(1)
-        yellow = self._pair(2)
-        red = self._pair(3)
+        accent = self._pair(PAIR_ACCENT)
+        warn = self._pair(PAIR_WARN)
+        alert = self._pair(PAIR_ALERT)
+        good = self._pair(PAIR_GOOD)
+        dim = self._pair(PAIR_DIM)
+        heavy = "═" if self._unicode_ok else "="
+        bar = BAR if self._unicode_ok else "|"
 
-        title = f" augur · {state.empire} · {state.game_date} "
+        # --- masthead
+        self._put(stdscr, 0, 0, self._band(" AUGUR ", width, heavy), width, accent | curses.A_BOLD)
+        right = state.game_date
         if state.version != "—":
-            title += f"· {state.version} "
-        self._put(stdscr, 0, 0, self._rule(title, width), width, cyan | curses.A_BOLD)
+            right += f"  {state.version}"
+        self._put(
+            stdscr, 1, 1, state.empire.upper(), max(0, width - len(right) - 4), accent | curses.A_BOLD
+        )
+        self._put(stdscr, 1, max(1, width - len(right) - 2), right, width, dim)
+        row = 2
+        if state.subtitle:
+            self._put(stdscr, row, 1, state.subtitle, width - 2, dim)
+            row += 1
+        self._put(stdscr, row, 0, heavy * (width - 1), width, accent)
+        row += 1
 
         if not state.loaded:
-            self._put(stdscr, 2, 2, state.message or "No campaign loaded.", width - 4, yellow)
-            self._put(stdscr, 4, 2, "Press r to read your newest save, q to quit.", width - 4)
+            self._put(stdscr, row + 1, 2, state.message or "No campaign loaded.", width - 4, warn)
+            self._put(stdscr, row + 3, 2, "[r] read newest save    [q] quit", width - 4, accent)
             stdscr.refresh()
             return
 
-        row = 1
+        # --- alert strip, reverse video so it reads as a HUD warning
         if state.alerts:
+            text = f" {ALERT_MARK if self._unicode_ok else '!'} " + "   ".join(state.alerts)
             self._put(
-                stdscr, row, 0, "  " + "   ".join(state.alerts)[: width - 2], width, red | curses.A_BOLD
+                stdscr, row, 0, text.ljust(width - 1), width,
+                alert | curses.A_BOLD | curses.A_REVERSE,
             )
             row += 1
 
-        # Two columns: facts on the left, resources on the right.
-        split = max(24, min(width // 2, 40))
+        # --- two columns
+        split = max(26, min(width // 2, 42))
+        self._put(stdscr, row, 1, f"{bar}EMPIRE", split - 1, accent | curses.A_BOLD)
+        self._put(
+            stdscr, row, split + 1, f"{bar}RESOURCE LEDGER", width - split, accent | curses.A_BOLD
+        )
         col_top = row + 1
-        self._put(stdscr, row, 2, "EMPIRE", width, cyan | curses.A_BOLD)
-        self._put(stdscr, row, split + 2, "RESOURCES", width, cyan | curses.A_BOLD)
 
-        for index, (key, value) in enumerate(state.facts):
+        # Track what was actually painted: both loops break early on a short
+        # terminal, so advancing by the full list length pushes the panes below
+        # off the bottom of the screen.
+        column_rows = budget_columns(
+            available=max(0, height - 1 - col_top),
+            longest_column=max(len(state.facts), len(state.stockpiles)),
+        )
+        last_drawn = col_top - 1
+        for index, (key, value) in enumerate(state.facts[:column_rows]):
             line = col_top + index
             if line >= height - 2:
                 break
-            self._put(stdscr, line, 2, f"{key:<13}{value}", split - 2)
+            self._put(stdscr, line, 3, f"{key:<13}", 14, dim)
+            self._put(stdscr, line, 17, value, max(0, split - 18))
+            last_drawn = max(last_drawn, line)
 
-        for index, (name, held, net) in enumerate(state.stockpiles):
+        for index, (name, held, net) in enumerate(state.stockpiles[:column_rows]):
             line = col_top + index
             if line >= height - 2:
                 break
-            text = f"{name:<15}{held:>12}"
+            self._put(stdscr, line, split + 3, f"{name:<15}", 16, dim)
+            self._put(stdscr, line, split + 19, f"{held:>10}", 11)
             if net:
-                text += f"  {net:>8}/mo"
-            self._put(stdscr, line, split + 2, text, width - split - 3)
+                room = max(0, width - split - 32)
+                text = f"{net:>8} /mo" if room >= 12 else f"{net:>8}"
+                self._put(
+                    stdscr, line, split + 31, text, room,
+                    warn if net.startswith("-") else good,
+                )
+            last_drawn = max(last_drawn, line)
 
-        row = col_top + max(len(state.facts), len(state.stockpiles)) + 1
+        trimmed = max(len(state.facts), len(state.stockpiles)) - column_rows
+        if trimmed > 0 and last_drawn >= col_top:
+            marker = f"+{trimmed} more"
+            # Anchor to the last row drawn, not the heading row, so it cannot
+            # land on top of the RESOURCE LEDGER title.
+            self._put(stdscr, last_drawn, max(1, width - len(marker) - 2), marker, 13, dim)
 
-        if state.trends and row < height - 4:
-            self._put(stdscr, row, 0, self._rule(" TRENDS ", width), width, cyan)
+        row = last_drawn + 2
+
+        # --- budget the two lower panes. The log is the pane the dashboard
+        # exists for, so it is served first and trends trim to fit.
+        allowed = budget_panes(
+            available=max(0, height - 1 - row),
+            trend_count=len(state.trends),
+            event_count=len(state.events),
+        )
+        visible_trends = state.trends[:allowed]
+
+        if visible_trends:
+            self._section(stdscr, row, "TRAJECTORY", width)
             row += 1
-            for trend in state.trends:
-                if row >= height - 3:
+            # Fixed columns; the value field ends at 30 and the arrow sits at 32,
+            # so the sparkline cannot start before 34.
+            spark_at = 34
+            for trend in visible_trends:
+                if row >= height - 2:
                     break
-                spark = sparkline(trend.values, unicode_ok=self._unicode_ok)
-                mark = arrow(trend, unicode_ok=self._unicode_ok)
-                text = f"  {trend.label:<15}{fmt_number(trend.current):>10}  {mark} {spark}"
                 pct = trend.pct
+                colour = 0
+                if pct is not None and abs(pct) >= 0.01:
+                    colour = good if pct > 0 else warn
+                self._put(stdscr, row, 3, f"{trend.label:<16}", 17, dim)
+                self._put(stdscr, row, 20, f"{fmt_number(trend.current):>10}", 11)
+                self._put(stdscr, row, 32, arrow(trend, unicode_ok=self._unicode_ok), 2, colour)
+                self._put(
+                    stdscr, row, spark_at,
+                    sparkline(trend.values, unicode_ok=self._unicode_ok),
+                    max(0, width - spark_at - 9), accent,
+                )
                 if pct is not None:
-                    text += f"  {pct * 100:+.0f}%"
-                self._put(stdscr, row, 0, text, width)
+                    at = min(spark_at + TREND_POINTS + 2, max(spark_at, width - 8))
+                    self._put(stdscr, row, at, f"{pct * 100:+.0f}%", 7, colour)
                 row += 1
+            hidden = len(state.trends) - len(visible_trends)
+            if hidden > 0:
+                self._put(stdscr, row - 1, max(1, width - 14), f"+{hidden} more", 13, dim)
             row += 1
 
-        if row < height - 3:
-            self._put(stdscr, row, 0, self._rule(" EVENTS ", width), width, cyan)
+        # --- situation log. Needs its heading plus at least one entry row;
+        # a bare heading tells the reader nothing.
+        if height - 1 - row >= LOG_MIN_ROWS:
+            self._section(stdscr, row, "SITUATION LOG", width)
             row += 1
-            space = max(1, height - 2 - row)
+            space = max(1, height - 1 - row)
             events = state.events
-            # Clamp the scroll so it cannot run off the end of the list.
+            # When the list scrolls, the position indicator needs a row of its
+            # own or it overwrites the last visible event.
+            if len(events) > space:
+                space = max(1, space - 1)
             max_scroll = max(0, len(events) - space)
             self._event_scroll = min(self._event_scroll, max_scroll)
             visible = events[self._event_scroll : self._event_scroll + space]
             if not visible:
                 self._put(
-                    stdscr, row, 2, "No events yet — detection needs two snapshots.", width - 2
+                    stdscr, row, 3, "No events yet — detection needs two snapshots.", width - 4, dim
                 )
             for date, kind, summary in visible:
-                if row >= height - 2:
+                if row >= height - 1:
                     break
-                self._put(stdscr, row, 2, f"{date}  {kind:<22} {summary}", width - 3)
+                self._put(stdscr, row, 3, date, 11, dim)
+                self._put(stdscr, row, 15, kind[:22], 23, accent)
+                self._put(stdscr, row, 39, summary, max(0, width - 40))
                 row += 1
+            if max_scroll and row < height - 1:
+                self._put(
+                    stdscr, row, max(1, width - 18),
+                    f"{self._event_scroll + 1}-{self._event_scroll + len(visible)}/{len(events)}",
+                    17, dim,
+                )
 
-        footer = f" {self._status} "
+        # --- footer
+        self._put(stdscr, height - 1, 0, heavy * (width - 1), width, accent)
+        status = f" {STATUS_MARK if self._unicode_ok else '*'} {self._status.upper()} "
         if log_lines:
-            footer += f"· {log_lines[-1]} "
-        keys = " [r]e-read  [j/k] scroll  [q]uit "
-        self._put(stdscr, height - 1, 0, " " * (width - 1), width)
-        self._put(stdscr, height - 1, 0, footer[: max(0, width - len(keys) - 2)], width)
-        self._put(stdscr, height - 1, max(0, width - len(keys) - 1), keys, width, cyan)
+            status += f"{'─' if self._unicode_ok else '-'} {log_lines[-1]} "
+        keys = " [r] re-read   [j/k] scroll   [q] quit "
+        room = width - len(keys) - 3
+        if room > 4:
+            self._put(stdscr, height - 1, 1, status[:room], width, accent | curses.A_BOLD)
+        self._put(stdscr, height - 1, max(1, width - len(keys) - 1), keys, width, dim)
         stdscr.refresh()
+
+    def _section(self, stdscr, row: int, title: str, width: int) -> None:
+        """▌TITLE ──────── : the rule starts after the title, whatever its length."""
+        bar = BAR if self._unicode_ok else "|"
+        light = "─" if self._unicode_ok else "-"
+        label = f"{bar}{title} "
+        self._put(stdscr, row, 1, label, width - 2, self._pair(PAIR_ACCENT) | curses.A_BOLD)
+        start = 1 + len(label)
+        self._put(stdscr, row, start, light * max(0, width - start - 2), width, self._pair(PAIR_DIM))
+
+    def _band(self, label: str, width: int, fill: str) -> str:
+        """A masthead rule with the label inset, HUD style."""
+        return (fill * 2 + label + fill * max(0, width - len(label) - 4))[: max(0, width - 1)]
 
     @staticmethod
     def _pair(index: int) -> int:

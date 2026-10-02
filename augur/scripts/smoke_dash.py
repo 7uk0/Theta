@@ -8,7 +8,8 @@ child pty, scrapes the byte stream, and checks for expected content.
 
     python3 scripts/smoke_dash.py                      # uses a temp archive
     python3 scripts/smoke_dash.py --db path/to.db      # uses a real one
-    python3 scripts/smoke_dash.py --rows 12 --cols 50  # cramped terminal
+    python3 scripts/smoke_dash.py --rows 12 --cols 50  # short terminal
+    python3 scripts/smoke_dash.py --rows 8 --cols 40    # below the minimum
 
 Exit status is 0 when every required marker was found.
 """
@@ -29,10 +30,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# Markers that must appear for the frame to count as drawn.
-REQUIRED = ["EMPIRE", "RESOURCES", "EVENTS", "[q]uit", "[r]e-read"]
-# Markers expected only when the archive holds a campaign.
-WITH_DATA = ["TRENDS"]
+# Markers that must appear for the frame to count as drawn. SITUATION LOG is the
+# invariant that matters: the pane the dashboard exists for must never be
+# squeezed out by the panes above it, at any size that renders at all.
+REQUIRED = ["EMPIRE", "RESOURCE LEDGER", "SITUATION LOG", "[q] quit", "[r] re-read"]
+# The trajectory pane is allowed to yield its rows to the log on a short
+# terminal, so only demand it when there is room for both.
+WITH_DATA = ["TRAJECTORY"]
+ROOMY_ROWS = 22
 
 
 def build_demo_archive(path: Path) -> None:
@@ -49,7 +54,12 @@ def build_demo_archive(path: Path) -> None:
     )
     briefing = {
         "meta": {"date": "2250.06.01", "version": "Phoenix v4.5.1", "campaign_id": "smoke"},
-        "identity": {"name": "Smoke Test Collective", "ethics": ["militarist"]},
+        "identity": {
+            "name": "Smoke Test Collective",
+            "empire_name": "Smoke Test Collective",
+            "authority": "auth_imperial",
+            "ethics": ["ethic_fanatic_militarist", "ethic_authoritarian"],
+        },
         "situation": {"game_phase": "mid", "at_war": True, "war_count": 1, "contact_count": 7},
         "economy": {
             "resources": {
@@ -176,18 +186,20 @@ def main() -> int:
     if "Traceback" in text:
         failures.append("traceback in output")
 
-    cramped = args.rows < 8 or args.cols < 40
+    cramped = args.rows < 11 or args.cols < 72
     # An archive with no campaign draws the pointer-to-ingest frame instead of
     # the panes. That is correct, so assert that frame rather than the panes.
     empty = "No campaign" in text or "ingested yet" in text
 
     if cramped:
-        expected = ["too small"]
+        expected = ["augur needs"]
     elif empty:
         expected = ["augur ·", "ingest", "Press r"]
         print("  (archive holds no campaign — checking the empty frame)")
     else:
-        expected = list(REQUIRED) + WITH_DATA
+        expected = list(REQUIRED)
+        if args.rows >= ROOMY_ROWS:
+            expected += WITH_DATA
 
     for marker in expected:
         found = marker in text
@@ -197,11 +209,13 @@ def main() -> int:
 
     glyphs = [g for g in "▁▂▃▄▅▆▇█" if g in text]
     arrows = [g for g in "↑↓→" if g in text]
-    if not cramped and not empty:
+    if not cramped and not empty and args.rows >= ROOMY_ROWS:
         print(f"  [{'ok' if glyphs else 'XX'}] sparkline glyphs {glyphs}")
         print(f"  [{'ok' if arrows else 'XX'}] trend arrows {arrows}")
         if not glyphs:
             failures.append("no sparkline rendered")
+    elif not cramped and not empty:
+        print(f"  (short terminal: trajectory pane may yield to the log — glyphs {glyphs})")
 
     if failures:
         print("\nFAILED:")

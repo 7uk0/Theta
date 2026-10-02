@@ -12,21 +12,24 @@ reached through Bash.
 
 ## Before anything else
 
-The commands live in the `augur` project. Run them from there, or with the
-project on `PYTHONPATH`:
+Run `augur <command>`. `install.sh` puts it on `PATH`, and the plain form is
+what the permissions allow, so prefer it everywhere:
 
 ```bash
-cd ~/Theta/augur && python3 -m augur.cli <command>
+augur status
 ```
 
-If `augur` is installed (`pip install -e ~/Theta/augur`), just `augur <command>`.
-Use whichever works; prefer the installed form.
+If `augur` is not found, it has not been installed yet — tell the user to run
+`~/Theta/augur/install.sh`. As a one-off fallback you can use
+`python3 -m augur.cli <command>` from `~/Theta/augur`, but say that the install
+is the fix rather than making the fallback a habit.
 
 **First run in a session:** `augur status`. It tells you which empire and date
 the archive holds, and how stale it is.
 
 - Exit code **3** or a "no campaign archive" message → the save has not been
-  read yet. Run `augur ingest` and continue.
+  read yet. Run `augur ingest` and continue. (Exit **1** is a real error, such as
+  a bad argument or an unreadable archive — do not answer it with an ingest.)
 - `freshness` says the data is old, or the user says they have been playing →
   run `augur ingest` to pick up the newest save, then proceed.
 
@@ -47,7 +50,13 @@ you are reading the save; do not silently stall.
 | Read the newest save | `augur ingest` |
 | Live dashboard while they play | `augur dash` (long-running; tell them to run it themselves in another terminal) |
 | Headless watching, no UI | `augur vigil` (long-running; same — they run it) |
+| Game mechanics for their patch | `augur knowledge [--topics "..."]` |
 | Something is broken | `augur doctor` |
+
+When a question turns on how a mechanic actually works in their version
+(naval cap formulas, trade routes, a rework), run `augur knowledge --topics
+"<the mechanic>"` — it returns the patch notes for the save's own game version,
+which beats answering from memory about a game that gets reworked every release.
 
 `augur brief` is the main one. It returns the campaign, a focused briefing,
 recent events, the player's own advisor instructions, and response guidance —
@@ -55,7 +64,9 @@ everything the old paid-API advisor was given. Prefer one `brief` over several
 narrow calls.
 
 Output is Markdown by default. Add `--json` when you need exact field names or
-a value the Markdown rounded — in particular before any Chronicle write.
+a value the Markdown rounded — in particular before any Chronicle write. The
+global flags work on either side of the subcommand, so `augur brief --json` and
+`augur --json brief` are both fine.
 
 Never run `dash` or `vigil` yourself: neither exits, and `dash` takes over the
 terminal. Tell the user to start them in their own terminal. If they are already
@@ -87,7 +98,9 @@ standing instruction — apply it.
   content they do not own; do not advise toward it.
 
 **Naval capacity is the classic trap.** `military.naval_capacity.used` is
-current usage, not the ceiling. Only state the limit when
+current usage, not the ceiling. The guard flags sit one level deeper, under
+`military.naval_capacity.analysis.*`, and are mirrored flat under
+`response_guidance.naval_capacity.*`. Only state the limit when
 `safe_to_claim_limit` is true; only say they are over/under/at cap when
 `safe_to_claim_over_cap` is true; only assert the upkeep penalty when
 `safe_to_claim_penalty` is true. If a flag is false, answer with uncertainty
@@ -116,18 +129,27 @@ Reading is free. Writing follows one sequence, every time:
    re-read and offer the merge; do not retry blindly.
 
 Put the prose in a file and pass the path — long narrative through a shell
-argument is a quoting minefield:
+argument is a quoting minefield. Write it under the user's scratch space or
+`/tmp`, not into the repo:
 
 ```bash
 augur chronicle create --campaign-ref "<ref>" --revision "<rev>" \
   --title "The Wartime Balance" --narrative-file /tmp/chapter.md
 ```
 
+Every write takes `--campaign-ref` and `--revision`, including undo:
+
 - `chronicle save` — write the current era as a chapter
-- `chronicle create` — add a chapter (needs `--title`)
+- `chronicle create --title "..."` — add a chapter
 - `chronicle update --chapter N` — rewrite one
-- `chronicle undo --edit-receipt <receipt>` — revert the last external edit;
-  the receipt comes back from the write that made it
+- `chronicle undo --edit-receipt <receipt>` — revert the last external edit. The
+  receipt comes back from the write that made it, and the guards are still
+  required:
+
+  ```bash
+  augur chronicle undo --campaign-ref "<ref>" --revision "<rev>" \
+    --edit-receipt "<receipt>"
+  ```
 
 Never save, update, create or undo on your own initiative. Draft, show, wait to
 be asked. After showing a draft, mention once that they can ask you to save it.
@@ -139,7 +161,8 @@ built only from what the source material actually contains. No invented battles.
 
 Run `augur doctor` and read the hints it prints.
 
-- "Rust parser not found" → `cd ~/Theta/augur/stellaris-parser && cargo build --release`
+- `[XX] Rust parser: ...` → `cd ~/Theta/augur/stellaris-parser && cargo build --release`
+  (or set `AUGUR_HOME` to a checkout that has it built)
 - "No save found" → ask for the folder, pass `--save /path/to/folder`
 - "still being written" → the game is mid-save; wait and retry
 - Events empty → event detection is a diff between snapshots; one ingest cannot

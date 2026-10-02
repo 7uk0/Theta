@@ -1,7 +1,7 @@
 ---
 description: Read or continue the Stellaris campaign Chronicle
 argument-hint: [read | write | continue]
-allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*), Bash(cd:*), Write
+allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*), Write(/tmp/**)
 ---
 
 Use the `augur` skill to work on the campaign Chronicle.

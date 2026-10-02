@@ -1,6 +1,6 @@
 ---
 description: Explain how to keep the Stellaris archive current while playing
-allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*), Bash(cd:*)
+allowed-tools: Bash(augur:*), Bash(python3 -m augur.cli:*)
 ---
 
 The user wants the campaign archive kept current while they play.

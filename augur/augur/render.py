@@ -59,11 +59,12 @@ def _tabulate(rows: list[dict[str, Any]]) -> list[str] | None:
     if not all(isinstance(r, dict) and r for r in rows):
         return None
 
-    columns: list[str] = []
+    columns: list = []
     for row in rows:
         for key in row:
             if key not in columns:
-                columns.append(str(key))
+                # Keep the original key object: it is what `row.get()` needs.
+                columns.append(key)
     if len(columns) > TABLE_MAX_COLUMNS:
         return None
     # Nested values flatten badly in a cell; keep those as bullets instead.
@@ -275,13 +276,25 @@ def render_chronicle(payload: dict[str, Any]) -> str:
             lines += [f"> {chapter['epigraph']}", ""]
         if chapter.get("summary"):
             lines += [str(chapter["summary"]), ""]
-        narrative = chapter.get("narrative") or chapter.get("text")
+        narrative = str(chapter.get("narrative") or chapter.get("text") or "")
         if narrative:
-            lines += [str(narrative), ""]
+            lines += [narrative, ""]
         for section in chapter.get("sections") or []:
-            if isinstance(section, dict):
-                lines += [f"### {section.get('heading') or section.get('title') or ''}", ""]
-                lines += [str(section.get("body") or section.get("text") or ""), ""]
+            if not isinstance(section, dict):
+                continue
+            body = str(section.get("body") or section.get("text") or "").strip()
+            # A chapter's `sections` normally restates the narrative as a single
+            # prose entry. Printing it again doubles the chapter — and the token
+            # cost this renderer exists to halve.
+            if not body or body == narrative.strip():
+                continue
+            heading = section.get("heading") or section.get("title")
+            if heading:
+                lines += [f"### {heading}", ""]
+            lines += [body, ""]
+            attribution = str(section.get("attribution") or "").strip()
+            if attribution:
+                lines += [f"— {attribution}", ""]
 
     current = payload.get("current_era")
     if isinstance(current, dict) and current:

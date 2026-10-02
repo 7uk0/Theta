@@ -28,7 +28,7 @@ def _assert_no_internal_leaks(value: object) -> None:
 
 
 def _make_test_db(tmp_path: Path) -> tuple[GameDatabase, str, list[int]]:
-    db = GameDatabase(db_path=tmp_path / "mcp.db")
+    db = GameDatabase(db_path=tmp_path / "campaign.db")
     session_id = db.get_or_create_active_session(
         save_id="save-mcp",
         save_path="/tmp/test-save.sav",
@@ -181,7 +181,7 @@ def _make_test_db(tmp_path: Path) -> tuple[GameDatabase, str, list[int]]:
     return db, session_id, snapshot_ids
 
 
-def test_mcp_context_returns_active_campaign(tmp_path: Path) -> None:
+def test_context_returns_active_campaign(tmp_path: Path) -> None:
     db, _, _ = _make_test_db(tmp_path)
     context = CampaignContext(db=db)
 
@@ -193,11 +193,13 @@ def test_mcp_context_returns_active_campaign(tmp_path: Path) -> None:
     assert payload["snapshot_count"] == 2
 
 
-def test_strategy_context_is_read_only_and_does_not_require_gemini(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+def test_strategy_context_returns_a_full_briefing_and_guidance(tmp_path: Path) -> None:
+    """The main read path: campaign state plus the guidance the reader follows.
+
+    (Formerly named "...does_not_require_gemini". There is no model client in
+    this fork at all, so that guarantee is now unfalsifiable rather than tested;
+    what is worth asserting is the shape and content of what comes back.)
+    """
     db, _, _ = _make_test_db(tmp_path)
     context = CampaignContext(db=db)
 
@@ -216,9 +218,11 @@ def test_strategy_context_is_read_only_and_does_not_require_gemini(
     assert guidance["presentation_contract"]["surface"] == "natural_chat"
     assert guidance["facts_policy"]["exact_numbers_only"] is True
     assert guidance["naval_capacity_policy"]["current_usage_path"]
+    # The guidance must name real commands, not the deleted MCP tool titles.
     assert guidance["tool_use_policy"]["main_tool"] == (
-        "Advisor Briefing is the preferred context for strategy questions."
+        "`augur brief` is the preferred context for strategy questions."
     )
+    assert "augur detail" in guidance["tool_use_policy"]["section_tool"]
     assert "raw_save_file_included" in payload["privacy"]
     assert payload["advisor_custom_instructions"]
     assert payload["advisor_memory"]
@@ -230,8 +234,12 @@ def test_strategy_context_is_read_only_and_does_not_require_gemini(
     _assert_no_internal_leaks(payload)
 
 
-def test_cached_chronicle_reads_cache_without_generation(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+def test_cached_chronicle_reads_from_the_archive(tmp_path: Path) -> None:
+    """Chronicle reads come straight from the archive; nothing generates prose.
+
+    (Formerly "...without_generation", when the thing not being invoked was
+    upstream's deleted chronicle.py generator.)
+    """
     db, _, _ = _make_test_db(tmp_path)
     context = CampaignContext(db=db)
 
