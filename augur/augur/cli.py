@@ -154,6 +154,18 @@ def cmd_vigil(args: argparse.Namespace) -> int:
         db.close()
 
 
+def cmd_dash(args: argparse.Namespace) -> int:
+    from augur.dash import run_dashboard
+
+    watch_paths = [Path(args.save_dir).expanduser()] if args.save_dir else None
+    return run_dashboard(
+        db_path=resolve_db_path(args.db),
+        language=args.language,
+        watch=not args.no_watch,
+        watch_paths=watch_paths,
+    )
+
+
 def cmd_saves(args: argparse.Namespace) -> int:
     from augur.parser.save_loader import find_all_saves, get_platform_save_paths
 
@@ -443,7 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  augur doctor            # check parser, deps, save folder\n"
             "  augur ingest            # read the newest save into the archive\n"
             "  augur brief -q 'who should I worry about?'\n"
-            "  augur vigil             # keep ingesting while you play\n"
+            "  augur dash              # live dashboard; ingests while you play\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"augur {__version__}")
@@ -463,6 +475,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--render", default=None, help="Write a Markdown briefing here after each ingest.")
     p.add_argument("--no-initial", action="store_true", help="Do not ingest the existing newest save.")
     p.set_defaults(func=cmd_vigil)
+
+    p = sub.add_parser(
+        "dash",
+        help="Live terminal dashboard: status, resources, trends, events.",
+        aliases=["orrery", "dashboard"],
+    )
+    p.add_argument("--save-dir", default=None, help="Directory to watch (default: platform paths).")
+    p.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="Do not ingest saves; display the archive only (use with a separate vigil).",
+    )
+    p.set_defaults(func=cmd_dash)
 
     p = sub.add_parser("saves", help="List detected save files.")
     p.add_argument("--save-dir", default=None, help="Directory to search.")

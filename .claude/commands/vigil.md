@@ -9,12 +9,20 @@ The user wants the campaign archive kept current while they play.
 foreground. Instead:
 
 1. Run `augur doctor` and confirm the parser, dependencies and save folder are in order.
-2. Give them the exact command to run in their own terminal, including the
-   optional Markdown render target:
+2. Give them the dashboard command to run in their own terminal — it watches,
+   ingests, and shows status, resources, trends and events as they play:
 
    ```bash
-   cd ~/Theta/augur && python3 -m augur.cli vigil --render ~/.local/state/augur/latest.md
+   augur dash
    ```
 
-3. Tell them that once it is running, every autosave lands in the archive and
-   they can ask for a briefing at any time without re-ingesting by hand.
+   Keys: `r` re-read now, `j`/`k` scroll events, `q` quit.
+
+3. If they would rather have no UI, give them the headless form instead:
+
+   ```bash
+   augur vigil --render ~/.local/state/augur/latest.md
+   ```
+
+4. Tell them that once either is running, every autosave lands in the archive
+   and they can ask for a briefing at any time without re-ingesting by hand.

@@ -45,7 +45,8 @@ you are reading the save; do not silently stall.
 | Read the campaign narrative | `augur chronicle read` |
 | Material for the next chapter | `augur chronicle source` |
 | Read the newest save | `augur ingest` |
-| Keep reading while they play | `augur vigil` (long-running; tell them to run it themselves in another terminal) |
+| Live dashboard while they play | `augur dash` (long-running; tell them to run it themselves in another terminal) |
+| Headless watching, no UI | `augur vigil` (long-running; same — they run it) |
 | Something is broken | `augur doctor` |
 
 `augur brief` is the main one. It returns the campaign, a focused briefing,
@@ -56,8 +57,10 @@ narrow calls.
 Output is Markdown by default. Add `--json` when you need exact field names or
 a value the Markdown rounded — in particular before any Chronicle write.
 
-Never run `vigil` yourself in the foreground: it does not exit. Tell the user
-to start it in their own terminal.
+Never run `dash` or `vigil` yourself: neither exits, and `dash` takes over the
+terminal. Tell the user to start them in their own terminal. If they are already
+running `augur dash`, the archive is being kept current for you — `status` will
+show fresh data and you rarely need to ingest by hand.
 
 ## How to answer
 

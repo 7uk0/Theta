@@ -39,8 +39,8 @@ cat <<'DONE'
 Installed. Next:
 
   augur ingest                      read your newest save
+  augur dash                        live dashboard; watches saves as you play
   augur brief -q "how am I doing?"  or just ask Claude Code about your empire
-  augur vigil                       keep reading saves while you play
 
 In Claude Code, the augur skill triggers on any question about your Stellaris
 campaign. /omen and /chronicle are there if you prefer to be explicit.

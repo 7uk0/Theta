@@ -49,15 +49,52 @@ augur brief -q "how am I doing?"    # or just ask Claude Code
 
 ## Using it
 
-**While playing**, keep the archive current in a second terminal:
+**While playing**, run the dashboard in one terminal:
+
+```bash
+augur dash
+```
+
+```
+ augur · Smoke Test Collective · 2250.06.01 · Phoenix v4.5.1 ─────────────────────
+  AT WAR (1)   DEFICIT: Energy
+  EMPIRE                          RESOURCES
+  Phase        Mid                Energy            5,400       -42/mo
+  At war       yes                Minerals          3,100      +110/mo
+  Colonies     11                 Alloys              980       +25/mo
+  Pops         240
+  Fleet power  18,200
+  Fleets       6
+  Techs        134
+ TRENDS ─────────────────────────────────────────────────────────────────────────
+  Military power     18,200  ↑ ▁▅█  +102%
+  Colonies               11  ↑ ▁▅█   +22%
+  Energy net            -42  → ▅▅▅    +0%
+ EVENTS ─────────────────────────────────────────────────────────────────────────
+  2250.06.01  War Started      The Collective entered the Rimward War.
+ vigil running · 2250.06.01 (new snapshot, 4.1s)   [r]e-read [j/k] scroll [q]uit
+```
+
+It watches the save folder itself, so every autosave is parsed and the panes
+update as you play. Alerts across the top are the things worth shouting: at war,
+resource deficits, a crisis, a fleet lost. Trends are real snapshot history, not
+a guess.
+
+Then ask questions in a second terminal (`claude`). The dashboard tells you
+*that* something changed; the conversation tells you what to do about it.
+
+Keys: `r` re-read the newest save now, `j`/`k` scroll events, `q` quit.
+
+If you would rather not have a dashboard, `augur vigil` does the ingesting with
+no UI, and `--render PATH` writes a Markdown briefing after each save so even a
+client that can only read files has something current:
 
 ```bash
 augur vigil --render ~/.local/state/augur/latest.md
 ```
 
-Every autosave is parsed and recorded as it lands. The optional `--render`
-writes a Markdown briefing to disk after each ingest, which means even a client
-that can only read files has something current to read.
+Run `augur dash --no-watch` to display an archive that a separate `vigil` is
+filling.
 
 **In Claude Code**, just ask. Or be explicit:
 
@@ -71,7 +108,8 @@ that can only read files has something current to read.
 | --- | --- |
 | `augur doctor` | Check parser, dependencies, save folder, archive. Start here when something is wrong. |
 | `augur ingest [--save PATH]` | Parse a save into the archive. Defaults to the newest save it can find. |
-| `augur vigil [--render PATH]` | Watch the save folder and ingest continuously. Runs until interrupted. |
+| `augur dash` | **Live dashboard.** Status, resources, trends, events; watches and ingests as you play. Runs until you press `q`. |
+| `augur vigil [--render PATH]` | Headless version of the same watching, no UI. Runs until interrupted. |
 | `augur saves` | List detected save files. |
 | `augur status` | Which campaign is loaded, which date, how fresh. |
 | `augur brief -q "..."` | **The main one.** Full strategy context for a question. |
@@ -155,6 +193,8 @@ you are already talking to.
   cancellable worker subprocess, because a GUI cannot block. A CLI can.
 - `augur/watch.py` — the save-folder vigil
 - `augur/render.py` — JSON → Markdown, roughly halving the token cost
+- `augur/dash.py` — the curses dashboard, replacing what the Electron app was
+  for (watching state change without asking) on stdlib `curses` alone
 - `.claude/skills/augur/` — the advisor persona, factual-accuracy contract and
   Chronicle write protocol, carried over from the system prompt and the MCP
   server instructions
@@ -168,8 +208,9 @@ Dependencies went from ten (including `google-genai`, `mcp`, `fastapi`,
 a cloud container. A Claude Code session driven from a phone cannot see those
 saves. Two ways to work:
 
-- **Claude Code on Wolf-Box** — the intended setup. The skill triggers, the CLI
-  runs locally, nothing crosses the network.
+- **Claude Code on Wolf-Box** — the intended setup. `augur dash` in one terminal,
+  `claude` in another. The skill triggers, the CLI runs locally, nothing crosses
+  the network.
 - **From a phone** — the container has no access to the saves. See
   `docs/PORT-NOTES.md` for what that constrains.
 
@@ -185,6 +226,14 @@ The CLI, renderer and ingest tests are new. The full parse pipeline is marked
 
 ```bash
 AUGUR_TEST_SAVE=~/path/to/save.sav python3 -m pytest -m integration
+```
+
+Curses rendering is covered separately, by driving the real command in a pty:
+
+```bash
+python3 scripts/smoke_dash.py                       # synthetic archive
+python3 scripts/smoke_dash.py --rows 6 --cols 30    # cramped terminal
+python3 scripts/smoke_dash.py --db ~/.local/state/augur/campaign.db
 ```
 
 ## Known limits

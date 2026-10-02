@@ -67,6 +67,7 @@ existing subscription.
   -> campaign.db (SQLite)      snapshots + detected events + Chronicle
   -> augur/context.py          the tool surface
   -> augur/cli.py -> stdout    Claude Code reasons over it
+  -> augur/dash.py             curses dashboard over the same context
 ```
 
 `context.py` is upstream's MCP tool layer with the JSON-RPC transport removed.
@@ -89,8 +90,12 @@ Keep it that way: the CLI is one caller, not the owner.
 - **No MCP server.** The commands are the interface.
 - The Rust parser must be built before anything works:
   `cd augur/stellaris-parser && cargo build --release`. `augur doctor` checks it.
-- `augur vigil` runs until interrupted. Never start it in the foreground of a
-  session; tell the User to run it in their own terminal.
+- `augur vigil` and `augur dash` run until interrupted. Never start either in
+  the foreground of a session; tell the User to run them in their own terminal.
+- The dashboard is stdlib `curses` on purpose — no `rich`, no `textual`. Its
+  pure parts (`build_state`, `extract_nets`, `sparkline`, `collect_alerts`) are
+  unit-tested; the curses path is covered by `scripts/smoke_dash.py`, which
+  drives the real command in a pty. Add to both when changing it.
 - Chronicle writes need `campaign_ref` + `chronicle_revision` from a *fresh*
   read. They are concurrency guards. Never write without an explicit request.
 
@@ -102,6 +107,10 @@ Keep it that way: the CLI is one caller, not the owner.
   this fork. If economy nets or pop counts come back zero on a real save, suspect
   the extractor's expected save structure before suspecting the CLI.
   `AUGUR_TEST_SAVE=path python3 -m pytest -m integration` runs the real pipeline.
+- `get_empire_briefing` nests its payload under a `sections` key while
+  `get_strategy_context` returns sections at the top level, and monthly nets
+  appear in three different shapes. Use `augur.dash.unwrap_sections` and
+  `extract_nets` rather than reaching into either shape directly.
 - Upstream strings referenced an Electron app and a Chronicle page that no
   longer exist. Several were fixed; if more surface in output, fix them rather
   than passing them through to the User.

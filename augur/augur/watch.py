@@ -24,6 +24,10 @@ from augur.ingest import IngestError, ingest_save
 
 logger = logging.getLogger(__name__)
 
+
+def _log_to_stderr(message: str) -> None:
+    print(f"vigil: {message}", file=sys.stderr)
+
 # Stellaris autosaves monthly on fast speed; one ingest per save is plenty.
 COALESCE_SECONDS = 3.0
 
@@ -38,10 +42,14 @@ class Vigil:
         watch_paths: list[Path] | None = None,
         on_ingest=None,
         coalesce_seconds: float = COALESCE_SECONDS,
+        log=None,
     ) -> None:
         self._db = db
         self._on_ingest = on_ingest
         self._coalesce_seconds = coalesce_seconds
+        # A curses front end must capture these lines rather than let them be
+        # printed over the display, so the sink is injectable.
+        self._log = log if log is not None else _log_to_stderr
 
         self._lock = threading.Lock()
         self._pending: Path | None = None
@@ -63,15 +71,14 @@ class Vigil:
     def run(self, *, ingest_existing: bool = True) -> int:
         if not self._watcher.start():
             searched = "\n  ".join(str(p) for p in self._watcher.watch_paths)
-            print(
+            self._log(
                 "No Stellaris save directory found to watch. Looked in:\n  "
-                f"{searched}\nPass --save-dir with the folder holding your .sav files.",
-                file=sys.stderr,
+                f"{searched}\nPass --save-dir with the folder holding your .sav files."
             )
             return 1
 
         for path in self._watcher.get_valid_watch_paths():
-            print(f"vigil: watching {path}", file=sys.stderr)
+            self._log(f"watching {path}")
 
         self._install_signal_handlers()
 
@@ -99,31 +106,35 @@ class Vigil:
                 self._ingest_once(target)
         finally:
             self._watcher.stop()
-            print("vigil: stopped", file=sys.stderr)
+            self._log("stopped")
         return 0
 
     def _ingest_once(self, save_path: Path) -> None:
         try:
             result = ingest_save(db=self._db, save_path=save_path)
         except IngestError as exc:
-            print(f"vigil: {exc}", file=sys.stderr)
+            self._log(str(exc))
             return
         except Exception as exc:  # noqa: BLE001 - a vigil must survive one bad save
             logger.exception("Unexpected ingest failure")
-            print(f"vigil: unexpected ingest failure: {exc}", file=sys.stderr)
+            self._log(f"unexpected ingest failure: {exc}")
             return
 
         state = "new snapshot" if result.inserted else "refreshed"
-        print(
-            f"vigil: {result.game_date or '?'} {result.empire_name or '?'} "
-            f"({state}, {result.duration_ms / 1000:.1f}s)",
-            file=sys.stderr,
+        self._log(
+            f"{result.game_date or '?'} {result.empire_name or '?'} "
+            f"({state}, {result.duration_ms / 1000:.1f}s)"
         )
         if self._on_ingest is not None:
             try:
                 self._on_ingest(result)
             except Exception as exc:  # noqa: BLE001 - rendering must not kill the vigil
-                print(f"vigil: post-ingest hook failed: {exc}", file=sys.stderr)
+                self._log(f"post-ingest hook failed: {exc}")
+
+    def stop(self) -> None:
+        """Ask the loop to exit. Safe to call from another thread."""
+        self._stop.set()
+        self._wake.set()
 
     def _install_signal_handlers(self) -> None:
         def handle(signum, frame):  # noqa: ARG001
